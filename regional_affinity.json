@@ -1,0 +1,31 @@
+{
+  "IN-MH": {
+    "product_affinity": {
+      "g-001": 0.92,
+      "g-003": 0.88,
+      "g-004": 0.95
+    },
+    "tag_affinity": {
+      "wayfarer": 1.15,
+      "metal": 1.08,
+      "aviator": 1.12,
+      "acetate": 0.95
+    }
+  },
+  "IN-KA": {
+    "product_affinity": {
+      "g-002": 0.9,
+      "g-005": 0.85,
+      "g-006": 0.8
+    },
+    "tag_affinity": {
+      "round": 1.1,
+      "cat_eye": 1.08,
+      "geometric": 1.05
+    }
+  },
+  "default": {
+    "product_affinity": {},
+    "tag_affinity": {}
+  }
+}

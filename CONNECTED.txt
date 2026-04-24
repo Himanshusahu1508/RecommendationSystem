@@ -1,0 +1,48 @@
+RS2 connected deployment (summary)
+=============================
+
+Hosting
+  - Default: FastAPI + Uvicorn in Docker (see Dockerfile, docker-compose.yml). Same image runs on ECS/EC2 with an IAM task/instance role.
+  - Lambda: not wired; for API Gateway + Lambda use a separate ASGI adapter (Mangum) in a follow-up.
+
+Client
+  - Web or mobile: HTTP multipart POST /v1/recommend, or S3 pre-upload + s3_key in form (see app/main.py).
+  - Webcam flow stays on the client; the server has no camera.
+
+Data
+  - SQLite file rs2.db when DATABASE_URL=sqlite:///./rs2.db (local, run from project root).
+  - Postgres: set DATABASE_URL=postgresql+psycopg2://... (see docker-compose).
+
+Secrets / AWS
+  - Prefer instance/task IAM role. Remove static AWS_ACCESS_KEY_ID from production; use local profile or env only for dev.
+  - Two accounts: keep your AWS_ACCESS_KEY_ID for Rekognition (face). For a friend’s catalog bucket only, set S3_CATALOG_ACCESS_KEY_ID + S3_CATALOG_SECRET_ACCESS_KEY (+ S3_CATALOG_REGION). Catalog downloads use those; selfie S3 and Rekognition use the main keys.
+  - S3: S3_USER_IMAGES_BUCKET for selfie keys; task role needs s3:GetObject.
+
+Embedding similarity (face vs glasses)
+  - Today, product vectors from S3 are compared (cosine) to a **face-shape prototype** vector, plus tag rules and other signals. That is not the same as embedding the person’s face with the *same* model as the products.
+  - For true “face photo → same space as catalog embeddings”, you need a shared encoder (e.g. your model) that outputs a query vector; then you would swap the prototype in ranking for that vector. Same EMBEDDING_DIM and model version as the catalog files.
+  - Catalog bucket: put a JSON array manifest at S3_CATALOG_MANIFEST_KEY (under optional S3_CATALOG_PREFIX). Embeddings can be inline in the manifest or in separate JSON files (embedding_s3_key or S3_EMBEDDING_KEY_PATTERN=embeddings/{id}.json). Use the same AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY as Rekognition if that IAM user has s3:GetObject on that bucket.
+  - CATALOG_SOURCE=auto (default): API reads catalog from S3 when S3_CATALOG_BUCKET is set; otherwise from DB. Set CATALOG_SOURCE=db to force DB only, or s3 to require S3.
+
+Seeding
+  - python scripts/seed_from_json.py  (local JSON files)
+  - python scripts/seed_from_s3.py   (manifest + embeddings from S3 → rs2.db)
+  - python scripts/etl_regional.py  (rebuild regional_cohort from orders)
+
+Flat S3 catalog (no manifest): images named lusmt{ID}_{view}.jpg in the bucket
+  - Set S3_CATALOG_PREFIX empty if files are at bucket root. Then:  python webcam_s3_eyewear.py
+  - Prints face shape + rules + JSON with eyewear_image_urls (presigned) for top frames.
+
+Run API locally
+  - pip install -r requirements.txt
+  - Set .env (AWS, optional DATABASE_URL)
+  - python scripts/seed_from_json.py
+  - uvicorn app.main:app --reload --port 8000
+  - curl -s http://127.0.0.1:8000/health
+
+Auth
+  - By default DISABLE_AUTH=true (see app/config.py). For production: set DISABLE_AUTH=false, API_BEARER_TOKEN=...
+
+Embedding contract
+  - EMBEDDING_DIM must match every catalog product embedding length and face-shape prototypes. Override vectors with EMBEDDING_JSON (path) or EMBEDDING_PROTO_JSON.
+  - EMBEDDING_MODEL_ID in app/config.py is metadata only (logging).

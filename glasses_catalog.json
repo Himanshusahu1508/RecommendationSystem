@@ -1,0 +1,62 @@
+[
+  {
+    "id": "g-001",
+    "name": "Ashford Rectangular",
+    "face_shapes": ["round", "oval"],
+    "frame_tags": ["angular", "rectangular", "narrow", "metal"],
+    "target_gender": "all",
+    "age_bands": ["youth", "adult", "mature", "senior"],
+    "popularity": 0.85,
+    "embedding": [0.9, 0.1, 0.2, 0.0, 0.3, 0.8, 0.0, 0.4]
+  },
+  {
+    "id": "g-002",
+    "name": "Harbor Round",
+    "face_shapes": ["long", "oval", "heart"],
+    "frame_tags": ["round", "soft", "acetate", "keyhole"],
+    "target_gender": "all",
+    "age_bands": ["youth", "adult", "mature"],
+    "popularity": 0.72,
+    "embedding": [0.1, 0.85, 0.8, 0.2, 0.1, 0.2, 0.3, 0.6]
+  },
+  {
+    "id": "g-003",
+    "name": "Summit Aviator",
+    "face_shapes": ["oval", "heart", "long"],
+    "frame_tags": ["aviator", "metal", "angular", "double_bridge"],
+    "target_gender": "M",
+    "age_bands": ["adult", "mature", "senior"],
+    "popularity": 0.91,
+    "embedding": [0.7, 0.2, 0.3, 0.9, 0.4, 0.5, 0.1, 0.2]
+  },
+  {
+    "id": "g-004",
+    "name": "Studio Wayfarer",
+    "face_shapes": ["all"],
+    "frame_tags": ["wayfarer", "acetate", "angular", "classic"],
+    "target_gender": "all",
+    "age_bands": ["all"],
+    "popularity": 0.88,
+    "embedding": [0.5, 0.4, 0.5, 0.3, 0.6, 0.4, 0.5, 0.5]
+  },
+  {
+    "id": "g-005",
+    "name": "North Cat-Eye",
+    "face_shapes": ["oval", "heart"],
+    "frame_tags": ["cat_eye", "acetate", "soft", "upsweep"],
+    "target_gender": "F",
+    "age_bands": ["youth", "adult", "mature"],
+    "popularity": 0.65,
+    "embedding": [0.2, 0.6, 0.7, 0.1, 0.2, 0.3, 0.8, 0.5]
+  },
+  {
+    "id": "g-006",
+    "name": "Edge Geometric",
+    "face_shapes": ["round", "long"],
+    "frame_tags": ["angular", "geometric", "metal", "bold"],
+    "target_gender": "all",
+    "age_bands": ["adult", "mature"],
+    "popularity": 0.58,
+    "embedding": [0.95, 0.0, 0.1, 0.0, 0.5, 0.9, 0.0, 0.3]
+  }
+]

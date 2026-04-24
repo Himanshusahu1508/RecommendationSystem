@@ -1,0 +1,30 @@
+# Local full stack: Postgres + API. Web/mobile clients call http://localhost:8000
+# Set AWS_ env vars (or use aws-vault) so Rekognition works from the API container.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: rs2
+      POSTGRES_PASSWORD: rs2
+      POSTGRES_DB: rs2
+    ports:
+      - "5432:5432"
+    volumes:
+      - rs2_pg:/var/lib/postgresql/data
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://rs2:rs2@db:5432/rs2
+      DISABLE_AUTH: "true"
+      AWS_DEFAULT_REGION: ap-south-1
+    depends_on:
+      - db
+    volumes:
+      - .:/app
+    # First run: docker compose run --rm api python scripts/seed_from_json.py
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  rs2_pg:
