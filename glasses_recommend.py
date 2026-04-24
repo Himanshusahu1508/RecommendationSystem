@@ -28,7 +28,7 @@ from facial_recognition import call_detect_faces, get_rekognition_client, read_i
 # Heuristic: ratio = jaw_w / face_h (see _jaw_width_and_face_height_px). **Higher** = wider jaw vs eye–chin height.
 # Six buckets in **increasing** order of ratio: rectangle, square, round, oval, long, heart.
 # Five cutoffs split the line: R < b0, b0≤R<b1, …, R ≥ b4 → heart.
-FACE_JAW_WH_BOUNDS: tuple[float, float, float, float, float] = (0.60, 0.68, 0.76, 0.84, 0.92)
+FACE_JAW_WH_BOUNDS: tuple[float, float, float, float, float] = (0.60, 0.70, 0.85, 0.95, 1.1)
 FACE_SHAPE_ORDER: tuple[str, ...] = (
     "rectangle",
     "square",
@@ -240,12 +240,26 @@ def recommend_from_bytes(
     ranking_weights: rs.RankingWeights | None = None,
     style_prompt: str | None = None,
     jaw_wh_bounds: tuple[float, float, float, float, float] | None = None,
+    style_reference_image_bytes: bytes | None = None,
+    use_preference_hybrid: bool = True,
+    hybrid_w_preference: float = 0.6,
+    hybrid_w_face: float = 0.4,
+    use_clip_preference: bool = False,
 ) -> dict[str, Any]:
     """
     Core recommendation: Rekognition on bytes + in-memory catalog and regional data.
     Used by the HTTP API; CLI uses recommend_pipeline on disk paths.
     If ``jaw_wh_bounds`` is set (5 increasing cutoffs for jaw_w/face_h), it overrides
     :data:`FACE_JAW_WH_BOUNDS` for face-shape bucketing.
+
+    **CLIP preference hybrid** (optional): when ``style_prompt`` (free text) and/or a
+    **style reference image** is provided *and* CLIP is enabled and the catalog has
+    ``clip_embedding`` rows, the final score blends CLIP preference with the **inner
+    rule-based** score (``w_prompt`` cleared in the inner pass). Configure weights via
+    ``hybrid_w_*`` and ``use_clip_preference`` (e.g. from :class:`~app.config.Settings`).
+    There is no separate keyword or substring search over the catalog.
+    When hybrid does not run, :func:`ranking_signals.personalized_rank` runs without
+    style text tokens (``style_prompt`` / ``keyword`` slots neutral).
     """
     if jaw_wh_bounds is not None:
         be = validate_jaw_wh_bounds(jaw_wh_bounds)
@@ -319,18 +333,80 @@ def recommend_from_bytes(
 
     rw = ranking_weights or rs.RankingWeights()
     wnorm = rw.normalized()
-    ranked = rs.personalized_rank(
-        candidates,
-        rules,
-        query_embedding,
-        demographics_used,
-        last_products,
-        ctx.region,
-        regional,
-        rw,
-        height_over_width=height_over_width,
-        style_prompt=style_prompt,
-    )[:top_n]
+
+    from app.preference.hybrid_merge import (
+        apply_preference_hybrid,
+        clip_hybrid_viable,
+        preference_scores_for_products,
+        ranking_weights_sans_style_prompt,
+    )
+
+    viable, viable_reason = clip_hybrid_viable(
+        style_prompt,
+        style_reference_image_bytes,
+        use_clip=use_clip_preference,
+        candidates=candidates,
+    )
+    hp = min(1.0, max(0.0, float(hybrid_w_preference)))
+    hf = min(1.0, max(0.0, float(hybrid_w_face)))
+    if use_preference_hybrid and viable and (hp + hf) > 1e-9:
+        rw_sans = ranking_weights_sans_style_prompt(rw)
+        ranked_inner = rs.personalized_rank(
+            candidates,
+            rules,
+            query_embedding,
+            demographics_used,
+            last_products,
+            ctx.region,
+            regional,
+            rw_sans,
+            height_over_width=height_over_width,
+            style_prompt=None,
+            keyword_query=None,
+        )
+        pref_map, pref_mode = preference_scores_for_products(
+            candidates,
+            style_prompt,
+            style_reference_image_bytes=style_reference_image_bytes,
+        )
+        ranked_merged = apply_preference_hybrid(
+            ranked_inner,
+            pref_map,
+            hp,
+            hf,
+        )
+        ranked = ranked_merged[:top_n]
+        hybrid_meta = {
+            "enabled": True,
+            "preference_mode": pref_mode,
+            "w_preference": hp,
+            "w_face_rules": hf,
+            "clip": True,
+        }
+    else:
+        ranked = rs.personalized_rank(
+            candidates,
+            rules,
+            query_embedding,
+            demographics_used,
+            last_products,
+            ctx.region,
+            regional,
+            rw,
+            height_over_width=height_over_width,
+            style_prompt=None,
+            keyword_query=None,
+        )[:top_n]
+        if not use_preference_hybrid:
+            _reason = "use_preference_hybrid is False"
+        elif (hp + hf) <= 1e-9:
+            _reason = "zero hybrid weights"
+        else:
+            _reason = viable_reason
+        hybrid_meta = {
+            "enabled": False,
+            "reason": _reason,
+        }
 
     out: dict[str, Any] = {
         "ok": True,
@@ -351,7 +427,8 @@ def recommend_from_bytes(
             "last_order_product_ids": lo_ids,
         },
         "ranking_weights": wnorm,
-        "style_prompt": style_prompt or "",
+        "clip_style_text": (style_prompt or "").strip(),
+        "hybrid": hybrid_meta,
         "recommendations": ranked,
     }
     return out

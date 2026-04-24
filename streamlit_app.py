@@ -1,7 +1,6 @@
 """
-Eyewear recommendation UI: face photo + rule-based face shape (6 buckets) + S3 catalog.
+Eyewear recommendation: face photo + AWS Rekognition + S3 catalog + optional CLIP style channel.
 
-Run from project root:
   .venv/bin/streamlit run streamlit_app.py
 """
 
@@ -20,16 +19,37 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 
+from app.config import refresh_settings_cache
+
+refresh_settings_cache()
+
+_PAGE_CSS = """
+<style>
+    .main .block-container { padding-top: 1.25rem; padding-bottom: 3rem; max-width: 1200px; }
+    h1.title-main { font-weight: 650; letter-spacing: -0.03em; margin-bottom: 0.15rem; }
+    p.subtitle { color: rgba(49, 51, 63, 0.65); font-size: 1.05rem; margin-top: 0; }
+    div[data-testid="stSidebarContent"] { background: linear-gradient(180deg, #fafbfc 0%, #f4f6f8 100%); }
+    .result-card {
+        border: 1px solid rgba(49, 51, 63, 0.1);
+        border-radius: 10px;
+        padding: 0.75rem 1rem;
+        margin-bottom: 0.75rem;
+        background: #fff;
+    }
+</style>
+"""
+
 
 @st.cache_data(ttl=120, show_spinner="Loading eyewear catalog from S3…")
-def _s3_product_rows() -> list[dict]:
+def _s3_product_rows(glass_key: str, _settings_cache_key: str) -> list[dict]:
     from app.config import get_settings
     from app.services.s3_flat_catalog import build_lusmt_flat_catalog
 
     s = get_settings()
     if not s.s3_catalog_bucket:
         return []
-    return build_lusmt_flat_catalog(s)
+    gc = glass_key.strip() if glass_key.strip() else None
+    return build_lusmt_flat_catalog(s, glass_category=gc)
 
 
 def _regional() -> dict | None:
@@ -40,184 +60,160 @@ def _regional() -> dict | None:
         return json.load(f)
 
 
+def _fmt_ratio(v: object) -> str:
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v):.4f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
 def main() -> None:
-    st.set_page_config(page_title="Eyewear recommend", layout="wide")
-    st.title("Eyewear recommendation")
-    st.caption(
-        "Rule-based face shape (jaw width ÷ height, six buckets), gender/age from AWS or overrides, "
-        "age-based **color palette** (vibrant for Kids/Teen, plain for Old), style prompt, regional cohort — "
-        "S3 flat catalog.",
+    st.set_page_config(
+        page_title="RS2 — Eyewear Studio",
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
-
-    if not os.environ.get("AWS_ACCESS_KEY_ID") and not os.environ.get("AWS_SESSION_TOKEN"):
-        st.error("Set AWS credentials in `.env` (or use a profile) for Rekognition and S3.")
-        return
-
-    products = _s3_product_rows()
-    if not products:
-        st.error(
-            "No `lusmt*_*_*.jpg` products found. Set `S3_CATALOG_BUCKET` and `S3_CATALOG_PREFIX` in `.env`.",
-        )
-        return
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        up = st.file_uploader("Upload face photo (JPEG/PNG)", type=["jpg", "jpeg", "png", "webp"])
-    with col_b:
-        cam = st.camera_input("Or capture from camera")
-
-    image_bytes: bytes | None = None
-    if up is not None:
-        image_bytes = up.getvalue()
-    elif cam is not None:
-        image_bytes = cam.getvalue()
-
-    st.subheader("Segmentation (optional overrides)")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        gender = st.radio(
-            "Gender",
-            ("From photo (Rekognition)", "Male", "Female"),
-            horizontal=True,
-        )
-    with c2:
-        age_mode = st.radio("Age", ("From photo", "Override age (years)"), horizontal=True)
-        age_years: int | None = None
-        if age_mode == "Override age (years)":
-            age_years = st.number_input("Years", min_value=0, max_value=120, value=30)
-    with c3:
-        life = st.selectbox(
-            "Age bracket (demographics + color palette rank)",
-            (
-                "Auto (from photo or age above)",
-                "Kids",
-                "Teenager",
-                "Adult",
-                "Old",
-            ),
-            help="Also drives color scoring: Kids/Teen → prefer vibrant; Old → prefer plain; Adult → neutral.",
-        )
-
-    with st.expander("Color ranking by age (how frames are boosted)", expanded=False):
-        st.markdown(
-            "| Age group | Palette preference |\n"
-            "|-----------|--------------------|\n"
-            "| **Kids**, **Teenager** | Vibrant / bold (`color_vibrant`, bright keywords) |\n"
-            "| **Adult** | Neutral (`color_neutral`) |\n"
-            "| **Old** | Plain / muted (`color_plain`, understated keywords) |\n"
-        )
-        st.caption(
-            "S3 catalog rows carry synthetic `color_vibrant` / `color_neutral` / `color_plain` tags. "
-            "Score appears as **color_lifecycle** in each result (0–1)."
-        )
-
-    region = st.text_input("Region (regional_affinity.json key)", value="default")
-    last_orders = st.text_input(
-        "Last order product ids (comma-separated, optional)",
-        placeholder="e.g. lusmt00438, lusmt00102",
-    )
-    style_prompt = st.text_area(
-        "Special style (keywords; boosts frames whose name/tags match)",
-        placeholder="e.g. aviator metal bold",
-        height=80,
-    )
-
-    from glasses_recommend import FACE_JAW_WH_BOUNDS, FACE_SHAPE_ORDER, validate_jaw_wh_bounds
-
-    if "jaw_cfg_init" not in st.session_state:
-        for i, v in enumerate(FACE_JAW_WH_BOUNDS):
-            st.session_state[f"jb{i}"] = float(v)
-        st.session_state["jaw_cfg_init"] = True
-
-    with st.expander("Face-shape thresholds (jaw width ÷ face height ratio)", expanded=False):
-        st.markdown(
-            "Six buckets in **increasing** order: **"
-            + " → **".join(FACE_SHAPE_ORDER)
-            + "**. Five cutoffs `b0…b4` must satisfy `b0 < b1 < … < b4`."
-        )
-        _custom = st.toggle(
-            "Use custom cutoffs (otherwise use code defaults from `glasses_recommend.FACE_JAW_WH_BOUNDS`)",
-            value=False,
-            key="custom_jaw_bounds",
-        )
-        st.caption(
-            "Regions: (rectangle &lt; b0) | [b0,b1) square | [b1,b2) round | "
-            "[b2,b3) oval | [b3,b4) long | heart ≥ b4"
-        )
-        if _custom:
-            r1, r2, r3, r4, r5 = st.columns(5)
-            for i, col in enumerate((r1, r2, r3, r4, r5)):
-                with col:
-                    st.number_input(
-                        f"b{i}",
-                        min_value=0.2,
-                        max_value=1.8,
-                        step=0.01,
-                        format="%.2f",
-                        key=f"jb{i}",
-                        help="All five must be strictly increasing. Lower b = stricter 'narrow' left buckets.",
-                    )
-            st.caption(
-                f"**Code defaults:** {list(FACE_JAW_WH_BOUNDS)}"
-            )
-            if st.button("Reset cutoffs to code defaults", key="reset_jaw"):
-                for i, v in enumerate(FACE_JAW_WH_BOUNDS):
-                    st.session_state[f"jb{i}"] = float(v)
-                st.rerun()
-
-    st.divider()
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        top_n = st.slider("Top N", 1, 15, 5)
-    with c5:
-        no_q = st.checkbox("Skip quality gate (pose/eyes EAR — faster, less strict)", value=False)
-    with c6:
-        go = st.button("Recommend", type="primary")
-
-    if not go:
-        st.info("Upload or capture a face, set options, then **Recommend**.")
-        return
-    if not image_bytes:
-        st.warning("Add an image or camera capture first.")
-        return
+    st.markdown(_PAGE_CSS, unsafe_allow_html=True)
 
     from app.config import get_settings
+    from app.services.catalog_s3_prefix import (
+        catalog_listing_fingerprint,
+        effective_catalog_s3_prefix,
+    )
+
+    s0 = get_settings()
+
+    with st.sidebar:
+        st.markdown("### Session")
+        if not os.environ.get("AWS_ACCESS_KEY_ID") and not os.environ.get("AWS_SESSION_TOKEN"):
+            st.error("Add AWS credentials to `.env` for Rekognition and S3.")
+        else:
+            st.success("AWS credentials loaded")
+        st.caption(
+            f"Hybrid blend · preference **{s0.hybrid_w_preference:.0%}** · face rules **{s0.hybrid_w_face:.0%}** "
+            f"(set in `.env`) · CLIP **{'on' if s0.clip_preference_enabled else 'off'}**"
+        )
+        glass_key = ""
+        if s0.s3_catalog_bucket and getattr(s0, "s3_use_glass_subfolders", True):
+            pick = st.radio(
+                "Catalog",
+                ("Sunglasses", "Normal glasses"),
+                horizontal=False,
+                label_visibility="visible",
+            )
+            glass_key = "sunglass" if pick == "Sunglasses" else "eyeglass"
+            eff = effective_catalog_s3_prefix(s0, glass_key)
+            st.caption(f"Prefix: `{eff or '(root)'}`")
+        else:
+            st.caption("Using full `S3_CATALOG_PREFIX` (subfolders off or no bucket)")
+
+        top_n = st.slider("How many frames", 1, 15, 5)
+        no_q = st.toggle("Skip face-quality gate", value=False, help="Allow weaker poses / lighting (testing only)")
+
+    st.markdown('<h1 class="title-main">Eyewear Studio</h1>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="subtitle">Face fit from your photo · optional CLIP style from words or a reference image · catalog from S3</p>',
+        unsafe_allow_html=True,
+    )
+
+    if not s0.s3_catalog_bucket:
+        st.warning("Set `S3_CATALOG_BUCKET` in `.env` to load products.")
+        return
+
+    products = _s3_product_rows(glass_key, catalog_listing_fingerprint(s0))
+    if not products:
+        from app.services.s3_flat_catalog import diagnose_flat_catalog
+
+        gc = glass_key.strip() if glass_key.strip() else None
+        st.error("No catalog rows from S3.")
+        st.json(diagnose_flat_catalog(s0, glass_category=gc), expanded=True)
+        return
+
+    st.caption(f"**{len(products)}** frames in view · blend & CLIP flags come from environment (not the UI)")
+
+    col_face, col_style = st.columns((1, 1), gap="large")
+    with col_face:
+        st.markdown("##### Your face")
+        u1, u2 = st.columns(2)
+        with u1:
+            up = st.file_uploader("Upload", type=["jpg", "jpeg", "png", "webp"], label_visibility="collapsed")
+        with u2:
+            cam = st.camera_input("Camera", label_visibility="collapsed")
+        image_bytes: bytes | None = up.getvalue() if up is not None else None
+        if image_bytes is None and cam is not None:
+            image_bytes = cam.getvalue()
+
+    with col_style:
+        st.markdown("##### Style (CLIP)")
+        st.caption("Same visual encoder as your catalog `clip_embedding` build — no keyword search over product text.")
+        style_text = st.text_area(
+            "Describe the look",
+            height=110,
+            placeholder="e.g. thin gold wire, bold acetate, sporty wrap …",
+            label_visibility="visible",
+            help="Encoded with CLIP. Leave empty if you only use an inspiration image.",
+        )
+        style_ref = st.file_uploader(
+            "Inspiration image (optional)",
+            type=["png", "jpg", "jpeg", "webp"],
+            help="A reference look (not your face). Combined with text when both are set.",
+        )
+
+    with st.expander("Demographics & context", expanded=False):
+        c3, c4, c5 = st.columns(3)
+        with c3:
+            gender = st.radio("Gender", ("From photo", "Male", "Female"), horizontal=True)
+        with c4:
+            age_mode = st.radio("Age", ("From photo", "Override years"), horizontal=True)
+            age_years: int | None = None
+            if age_mode == "Override years":
+                age_years = st.number_input("Years", 0, 120, 30, label_visibility="collapsed")
+        with c5:
+            life = st.selectbox(
+                "Color palette bracket",
+                ("Auto", "Kids", "Teenager", "Adult", "Old"),
+            )
+        region = st.text_input("Region key", value="default")
+        last_orders = st.text_input("Last order product ids (comma-separated)", placeholder="optional")
+
+    go = st.button("Get recommendations", type="primary", use_container_width=True)
+
+    if not go:
+        st.info("Add your face photo, optionally add style text or a reference image, then run **Get recommendations**.")
+        return
+    if not image_bytes:
+        st.warning("Upload a face image or use the camera.")
+        return
+
     from app.embedding_config import load_face_shape_prototypes
     from app.services.s3_image import enrich_recommendations_with_presign
     from glasses_recommend import _image_size_from_bytes, recommend_from_bytes
     from ranking_signals import RankingWeights
 
-    jaw_arg: tuple[float, ...] | None = None
-    if st.session_state.get("custom_jaw_bounds", False):
-        b = tuple(float(st.session_state[f"jb{i}"]) for i in range(5))
-        verr = validate_jaw_wh_bounds(b)
-        if verr:
-            st.error(verr)
-            return
-        jaw_arg = b
-
-    s = get_settings()
     try:
-        prototypes = load_face_shape_prototypes(s.embedding_dim)
+        prototypes = load_face_shape_prototypes(s0.embedding_dim)
     except ValueError as e:
         st.error(str(e))
         return
 
     user_context: dict = {"region": region or None, "last_order_product_ids": []}
     if last_orders.strip():
-        user_context["last_order_product_ids"] = [
-            x.strip() for x in last_orders.split(",") if x.strip()
-        ]
+        user_context["last_order_product_ids"] = [x.strip() for x in last_orders.split(",") if x.strip()]
     if gender == "Male":
         user_context["gender_override"] = "Male"
     elif gender == "Female":
         user_context["gender_override"] = "Female"
-    if age_mode == "Override age (years)" and age_years is not None:
+    if age_mode == "Override years" and age_years is not None:
         user_context["age_override"] = int(age_years)
-    if life != "Auto (from photo or age above)":
+    if life != "Auto":
         user_context["age_lifecycle_override"] = life
 
     w, h = _image_size_from_bytes(image_bytes)
+    ref_bytes = style_ref.getvalue() if style_ref is not None else None
+    st_prompt = (style_text or "").strip() or None
+
     out = recommend_from_bytes(
         image_bytes,
         w,
@@ -229,10 +225,14 @@ def main() -> None:
         user_context=user_context,
         face_shape_prototypes=prototypes,
         ranking_weights=RankingWeights(),
-        style_prompt=style_prompt.strip() or None,
-        jaw_wh_bounds=jaw_arg,
+        style_prompt=st_prompt,
+        style_reference_image_bytes=ref_bytes,
+        use_preference_hybrid=s0.use_preference_hybrid,
+        hybrid_w_preference=s0.hybrid_w_preference,
+        hybrid_w_face=s0.hybrid_w_face,
+        use_clip_preference=s0.clip_preference_enabled,
     )
-    out = enrich_recommendations_with_presign(s, out)
+    out = enrich_recommendations_with_presign(s0, out)
 
     if not out.get("ok"):
         st.json(out)
@@ -241,35 +241,40 @@ def main() -> None:
     demo = out.get("demographics") or {}
     fg = out.get("face_geometry") or {}
     lc = demo.get("age_lifecycle")
-    if lc in ("Kids", "Teenager"):
-        _color_hint = "Prefer **vibrant** frames for this age group."
-    elif lc == "Adult":
-        _color_hint = "Prefer **neutral** palettes."
-    elif lc == "Old":
-        _color_hint = "Prefer **plain / muted** frames for this age group."
-    else:
-        _color_hint = "Set **Age bracket** (or use a clear face photo) for stronger color bias."
-    st.success(
-        f"**Face shape:** {out.get('face_shape', '?')}  ·  **Gender (used):** {demo.get('gender_label', '?')}  ·  "
-        f"**Age lifecycle:** {lc or '?'} "
-        f"(est. {demo.get('age_low', '?')}-{demo.get('age_high', '?')} y)",
-    )
-    st.info(f"**Color policy:** {_color_hint}")
-
-    wn = (out.get("ranking_weights") or {}) if isinstance(out.get("ranking_weights"), dict) else {}
-    wcol = wn.get("w_color")
-    if wcol is not None:
-        st.caption(
-            f"Color signal weight in blend: `w_color` ≈ **{float(wcol):.3f}** (see `color_lifecycle` per frame below).",
-        )
-
     binfo = out.get("face_shape_buckets") or {}
+
+    st.divider()
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Face shape", str(out.get("face_shape", "—")))
+    with m2:
+        st.metric("Gender", str(demo.get("gender_label", "—")))
+    with m3:
+        st.metric("Age (est.)", f"{demo.get('age_low', '?')}-{demo.get('age_high', '?')}")
+    with m4:
+        st.metric("Lifecycle", str(lc or "—"))
+
+    jratio = fg.get("jaw_width_to_face_height")
     st.caption(
-        f"jaw_w / face_h = {fg.get('jaw_width_to_face_height', '?')!s}  ·  "
-        f"cutoffs: {binfo.get('jaw_width_to_height_cutoffs')} "
-        f"({binfo.get('jaw_width_to_height_cutoffs_source', 'default')})  ·  "
-        f"order: {binfo.get('order')}",
+        f"Jaw / face height ratio: **{_fmt_ratio(jratio)}** · bucket cutoffs (fixed in code): "
+        f"`{binfo.get('jaw_width_to_height_cutoffs', [])}`"
     )
+
+    hy = out.get("hybrid")
+    if isinstance(hy, dict):
+        if hy.get("enabled"):
+            st.caption(
+                f"**CLIP style blend** · `{hy.get('preference_mode', '?')}` "
+                f"· read `hybrid` in the JSON for weights."
+            )
+        else:
+            st.caption(f"Style blend: *off* — `{hy.get('reason', '')}`")
+
+    if st_prompt or ref_bytes:
+        st.caption("CLIP query: " + ("text + image" if (st_prompt and ref_bytes) else ("text" if st_prompt else "image")))
+
+    if out.get("ok") and not (out.get("recommendations") or []):
+        st.warning(out.get("note") or "No recommendations in this run.")
 
     for i, r in enumerate(out.get("recommendations") or [], 1):
         sb = r.get("score_breakdown") or {}
@@ -277,25 +282,26 @@ def main() -> None:
         cfam = r.get("color_family")
         ctag = None
         for t in r.get("frame_tags") or []:
-            s = str(t)
-            if s.startswith("color_"):
-                ctag = s
+            if str(t).startswith("color_"):
+                ctag = str(t)
                 break
-        m1, m2, m3 = st.columns([2.2, 1, 1])
-        with m1:
-            st.markdown(f"### {i}. {r.get('name', r.get('id'))} — score `{r.get('score')}`")
-        with m2:
+        st.markdown(
+            f'<div class="result-card"><h3 style="margin:0 0 0.35rem 0;">{i}. {r.get("name", r.get("id"))}</h3>'
+            f'<p style="margin:0;color:#444;">Score <code>{r.get("score")}</code></p></div>',
+            unsafe_allow_html=True,
+        )
+        c_a, c_b, c_c = st.columns(3)
+        with c_b:
             if cscore is not None:
-                st.metric("Color fit (0–1)", f"{float(cscore):.2f}")
-        with m3:
+                st.metric("Color fit", f"{float(cscore):.2f}")
+        with c_c:
             fam = cfam or (ctag.replace("color_", "") if ctag else "—")
-            st.metric("Frame palette tag", str(fam))
-        sb_show = dict(sb)
-        if "weights" in sb_show:
-            del sb_show["weights"]
-        st.json(sb_show, expanded=False)
+            st.metric("Palette", str(fam))
+        sb_show = {k: v for k, v in sb.items() if k != "weights"}
+        with st.expander("Score detail", expanded=False):
+            st.json(sb_show)
         for url in r.get("eyewear_image_urls") or []:
-            st.image(url, width=400)
+            st.image(url, width=420)
 
 
 if __name__ == "__main__":

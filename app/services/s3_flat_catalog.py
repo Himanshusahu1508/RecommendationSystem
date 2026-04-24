@@ -1,12 +1,10 @@
 """
-Build a product catalog from a *flat* S3 bucket of eyewear images named:
-  lusmt{PRODUCT_ID}_{VIEW}.jpg
-Example: lusmt00438_0.jpg … lusmt00438_3.jpg  → one product lusmt00438 with 4 views.
+Build a product catalog from a *flat* S3 prefix: JPEG objects named ``PRODUCTID_VIEWINDEX.jpg``
+(e.g. ``lusmt00438_0.jpg``, ``cp0031_0.jpeg``). Multiple views per product share the same id with
+different view indices.
 
-When no manifest.json exists, we assign synthetic per-product tags and normalized
-embedding vectors (derived from the product id) so the existing hybrid ranker
-(tag match vs face-shape rules + cosine) can differentiate items. For true
-visual similarity to the user’s face, replace with a shared embedding model.
+Synthetic tags and embeddings are derived from each product id until you supply a manifest
+and real embeddings from S3.
 """
 
 from __future__ import annotations
@@ -17,10 +15,14 @@ from collections import defaultdict
 from typing import Any
 
 from app.config import Settings
+from app.services.catalog_s3_prefix import effective_catalog_s3_prefix
 from app.services.s3_image import get_catalog_s3_client
 
-# Filename at end of key: lusmt00438_2.jpg
-_LUSMT = re.compile(r"^(?P<pid>lusmt\d+)_(?P<view>\d+)\.(?P<ext>jpe?g)$", re.IGNORECASE)
+# Filename at end of key: lusmt00438_2.jpg, FRAME-A_0.jpg, sku123_1.jpeg — {productId}_{viewIndex}.jpg
+_FRAME_IMAGE = re.compile(
+    r"^(?P<pid>[\w-]+)_(?P<view>\d+)\.(?P<ext>jpe?g)$",
+    re.IGNORECASE,
+)
 
 _STYLES = [
     "wayfarer",
@@ -57,7 +59,6 @@ def _synthetic_color_family_tag(pid: str) -> str:
 
 def _synthetic_unit_embedding(pid: str, dim: int) -> list[float]:
     h = hashlib.sha256(f"eyewear-emb:{pid}".encode()).digest()
-    n = min(dim, 32)
     v = [float((h[i] + h[(i * 3) % 32]) % 256) / 128.0 - 1.0 for i in range(dim)]
     s = sum(x * x for x in v) ** 0.5
     if s < 1e-9:
@@ -65,12 +66,15 @@ def _synthetic_unit_embedding(pid: str, dim: int) -> list[float]:
     return [x / s for x in v]
 
 
-def _list_all_object_keys(s: Settings) -> list[str]:
+def _list_all_object_keys(s: Settings, *, list_prefix: str | None = None) -> list[str]:
     b = s.s3_catalog_bucket
     if not b:
         return []
     client = get_catalog_s3_client(s)
-    prefix = (s.s3_catalog_prefix or "").lstrip("/")
+    if list_prefix is not None:
+        prefix = (list_prefix or "").lstrip("/")
+    else:
+        prefix = (s.s3_catalog_prefix or "").lstrip("/")
     keys: list[str] = []
     paginator = client.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=b, Prefix=prefix, PaginationConfig={"PageSize": 1000}):
@@ -82,15 +86,23 @@ def _list_all_object_keys(s: Settings) -> list[str]:
     return keys
 
 
-def build_lusmt_flat_catalog(s: Settings) -> list[dict[str, Any]]:
+def build_lusmt_flat_catalog(
+    s: Settings,
+    *,
+    glass_category: str | None = None,
+) -> list[dict[str, Any]]:
     """
     Return catalog rows: id, name, s3_key (primary view), s3_bucket, s3_image_keys, frame_tags, embedding, face_shapes, popularity.
+
+    ``glass_category``: ``sunglass`` / ``eyeglass`` narrows under ``S3_GLASS_PARENT`` and optional
+    per-type extra segments (see :func:`app.services.catalog_s3_prefix.effective_catalog_s3_prefix`). Omit to list only under ``S3_CATALOG_PREFIX``.
     """
-    keys = _list_all_object_keys(s)
+    eff = effective_catalog_s3_prefix(s, glass_category)
+    keys = _list_all_object_keys(s, list_prefix=eff)
     by_pid: dict[str, list[tuple[int, str]]] = defaultdict(list)
     for k in keys:
         base = k.rsplit("/", 1)[-1]
-        m = _LUSMT.match(base)
+        m = _FRAME_IMAGE.match(base)
         if not m:
             continue
         pid = m.group("pid")
@@ -125,3 +137,47 @@ def build_lusmt_flat_catalog(s: Settings) -> list[dict[str, Any]]:
             },
         )
     return out
+
+
+def diagnose_flat_catalog(
+    s: Settings,
+    *,
+    glass_category: str | None = None,
+    sample: int = 5,
+) -> dict[str, Any]:
+    """
+    Why the flat catalog might be empty: effective prefix, JPEG count, regex match count, sample keys.
+    """
+    eff = effective_catalog_s3_prefix(s, glass_category)
+    keys = _list_all_object_keys(s, list_prefix=eff)
+    unmatched: list[str] = []
+    matched_bases: list[str] = []
+    for k in keys:
+        base = k.rsplit("/", 1)[-1]
+        if _FRAME_IMAGE.match(base):
+            matched_bases.append(base)
+        else:
+            if len(unmatched) < 16:
+                unmatched.append(base)
+    root = (s.s3_catalog_prefix or "").strip()
+    path_hint: str | None = None
+    if root and (not keys or not matched_bases):
+        path_hint = (
+            f"If objects are at s3://{s.s3_catalog_bucket or 'BUCKET'}/Glass/... (not under `{root}/Glass/...`), "
+            "set S3_CATALOG_PREFIX empty. The `all_images` folder in your bucket is only under `Glass/Sunglass/`; "
+            "sunglass listing uses S3_GLASS_SUNGLASS_EXTRA_PREFIX=all_images, not the global catalog prefix."
+        )
+    return {
+        "s3_bucket": s.s3_catalog_bucket,
+        "effective_prefix": eff,
+        "s3_catalog_prefix_root": root or None,
+        "s3_glass_sunglass_extra_prefix": getattr(s, "s3_glass_sunglass_extra_prefix", None),
+        "s3_glass_eyeglass_extra_prefix": getattr(s, "s3_glass_eyeglass_extra_prefix", None),
+        "use_glass_subfolders": getattr(s, "s3_use_glass_subfolders", True),
+        "jpg_object_count": len(keys),
+        "filename_pattern_matched": len(matched_bases),
+        "expected_filename_shape": "PRODUCTID_VIEWINDEX.jpg (e.g. lusmt00438_0.jpg, cp0031_0.jpeg)",
+        "sample_object_keys": keys[:sample],
+        "sample_unmatched_filenames": unmatched[:8],
+        "path_hint": path_hint,
+    }

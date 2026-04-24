@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     # Catalog on S3: manifest (JSON array) + per-row embeddings inline or in separate JSON in bucket.
     s3_catalog_bucket: Optional[str] = None
     s3_catalog_prefix: str = ""
+    # Optional layout: …/Glass/Sunglass/ vs …/Glass/Normal_glass/ (S3 is case-sensitive; override via env)
+    s3_use_glass_subfolders: bool = True
+    s3_glass_parent: str = "Glass"
+    s3_glass_sunglass_folder: str = "Sunglass"
+    s3_glass_eyeglass_folder: str = "Normal_glass"
+    # Extra path under each type folder (your bucket: Sunglass has all_images/, Normal_glass has images at root)
+    s3_glass_sunglass_extra_prefix: str = "all_images"
+    s3_glass_eyeglass_extra_prefix: str = ""
     s3_catalog_manifest_key: str = "manifest.json"
     # When manifest rows omit "embedding", fetch using this path pattern (under prefix) or per-row "embedding_s3_key"
     s3_embedding_key_pattern: str = "embeddings/{id}.json"
@@ -47,6 +55,13 @@ class Settings(BaseSettings):
     s3_regional_json_key: Optional[str] = None
     # auto: use S3 if s3_catalog_bucket is set, else DB | db | s3
     catalog_source: str = "auto"
+
+    # Hybrid: CLIP preference vs rule-based inner score (face + pop + region + … without w_prompt)
+    use_preference_hybrid: bool = True
+    hybrid_w_preference: float = 0.6
+    hybrid_w_face: float = 0.4
+    # When true, optional style text / reference image use CLIP vs per-row clip_embedding (requires optional deps + embeddings in catalog).
+    clip_preference_enabled: bool = True
 
     # Embedding / ranking (align with your model in production)
     embedding_model_id: str = "prototype-8d"
@@ -59,3 +74,8 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def refresh_settings_cache() -> None:
+    """Drop cached Settings so the next :func:`get_settings` reloads from the environment (e.g. after editing ``.env``)."""
+    get_settings.cache_clear()

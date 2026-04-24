@@ -33,6 +33,12 @@ def main() -> int:
         default=None,
         help="S3 prefix to list (default: from S3_CATALOG_PREFIX in .env, or empty)",
     )
+    p.add_argument(
+        "--glass",
+        choices=("sunglass", "eyeglass", "normal"),
+        default=None,
+        help="List under effective …/glass/<subfolder>/ (same as app catalog toggle); omit for raw prefix",
+    )
     p.add_argument("--max", type=int, default=200, help="Max keys to print")
     args = p.parse_args()
 
@@ -40,9 +46,17 @@ def main() -> int:
         print("Set S3_CATALOG_BUCKET in .env", file=sys.stderr)
         return 1
 
+    from app.services.catalog_s3_prefix import effective_catalog_s3_prefix
+
     prefix = args.prefix
     if prefix is None:
-        prefix = s.s3_catalog_prefix or ""
+        gcat = args.glass
+        if gcat == "normal":
+            gcat = "eyeglass"
+        if gcat is not None:
+            prefix = effective_catalog_s3_prefix(s, gcat)
+        else:
+            prefix = s.s3_catalog_prefix or ""
 
     client = get_catalog_s3_client(s)
     n = 0

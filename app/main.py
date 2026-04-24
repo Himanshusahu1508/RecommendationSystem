@@ -83,7 +83,18 @@ def recommend(
     ),
     top_n: int = Form(default=5),
     no_quality: bool = Form(default=False),
-    style_prompt: Optional[str] = Form(default=None, description="Optional style keywords; boosts tag/name matches"),
+    style_prompt: Optional[str] = Form(
+        default=None,
+        description="Optional free text for CLIP style encoding (with style_reference_image)",
+    ),
+    glass_category: Optional[str] = Form(
+        default=None,
+        description="Catalog slice: sunglass | eyeglass | normal — under …/glass/<folder>/ (see S3_GLASS_* env)",
+    ),
+    style_reference_image: Optional[UploadFile] = File(
+        default=None,
+        description="Optional mood/style image for CLIP+hybrid (not the selfie; uses image field for face)",
+    ),
 ) -> Any:
     _apply_aws_env(settings)
     _check_bearer(authorization)
@@ -114,9 +125,12 @@ def recommend(
         raise HTTPException(502, detail=f"Storage error: {e!s}") from e
 
     w, h = _image_size_from_bytes(image_bytes)
+    ref_bytes: bytes | None = None
+    if style_reference_image is not None:
+        ref_bytes = style_reference_image.file.read()
 
     try:
-        products = catalog.get_catalog_products(db, settings)
+        products = catalog.get_catalog_products(db, settings, glass_category=glass_category)
     except ValueError as e:
         raise HTTPException(400, detail=str(e)) from e
     except RuntimeError as e:
@@ -160,7 +174,14 @@ def recommend(
         face_shape_prototypes=prototypes,
         ranking_weights=RankingWeights(),
         style_prompt=style_prompt,
+        style_reference_image_bytes=ref_bytes,
+        use_preference_hybrid=settings.use_preference_hybrid,
+        hybrid_w_preference=settings.hybrid_w_preference,
+        hybrid_w_face=settings.hybrid_w_face,
+        use_clip_preference=settings.clip_preference_enabled,
     )
+    if glass_category is not None:
+        out = {**out, "catalog_glass_category": glass_category}
     return out
 
 

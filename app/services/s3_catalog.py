@@ -18,6 +18,7 @@ from typing import Any
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.config import Settings
+from app.services.catalog_s3_prefix import effective_catalog_s3_prefix
 from app.services.s3_image import download_s3_object, get_catalog_s3_client
 
 # Simple TTL cache: (bucket, manifest_key) -> (timestamp, data)
@@ -53,11 +54,13 @@ def load_catalog_from_s3(
     s: Settings,
     *,
     use_cache: bool = True,
+    glass_category: str | None = None,
 ) -> list[dict[str, Any]]:
     if not s.s3_catalog_bucket:
         raise ValueError("s3_catalog_bucket is not set")
 
-    manifest_key = _join_s3_key(s.s3_catalog_prefix, s.s3_catalog_manifest_key)
+    prefix = effective_catalog_s3_prefix(s, glass_category)
+    manifest_key = _join_s3_key(prefix, s.s3_catalog_manifest_key)
     ck = (s.s3_catalog_bucket, manifest_key)
     now = time.time()
     if use_cache and ck in _cache:
@@ -91,7 +94,7 @@ def load_catalog_from_s3(
             if not emb_key and pid and s.s3_embedding_key_pattern:
                 emb_key = s.s3_embedding_key_pattern.format(id=pid)
             if emb_key:
-                ek = emb_key if emb_key.startswith("/") else _join_s3_key(s.s3_catalog_prefix, str(emb_key).lstrip("/"))
+                ek = emb_key if emb_key.startswith("/") else _join_s3_key(prefix, str(emb_key).lstrip("/"))
                 ekb = s.s3_catalog_bucket
                 try:
                     emb_raw = _fetch_object(ekb, ek, s)

@@ -21,13 +21,13 @@ from typing import Any
 class RankingWeights:
     """Weights should be non-negative; the pipeline renormalizes to sum to 1."""
 
-    w_face: float = 0.25  # face-shape rules + tag + style embedding
+    w_face: float = 0.20  # face-shape rules + tag + style embedding
     w_pop: float = 0.08  # global catalog popularity
-    w_demo: float = 0.13  # gender + age fit
-    w_purchase: float = 0.22  # last order similarity
-    w_region: float = 0.18  # regional cohort
-    w_prompt: float = 0.08  # free-text style keywords vs product tags/name
-    w_color: float = 0.08  # age-lifecycle color palette (vibrant vs plain)
+    w_demo: float = 0.12  # gender + age fit
+    w_purchase: float = 0.20  # last order similarity
+    w_region: float = 0.16  # regional cohort
+    w_prompt: float = 0.18  # style + keyword prompts vs product text/tags (user preference)
+    w_color: float = 0.06  # age-lifecycle color palette (vibrant vs plain)
 
     def normalized(self) -> dict[str, float]:
         t = (
@@ -368,25 +368,65 @@ def score_color_lifecycle_match(product: dict[str, Any], demo: dict[str, Any]) -
     return 0.5
 
 
-def score_style_prompt_match(product: dict[str, Any], prompt: str | None) -> float:
+def parse_search_tokens(*queries: str | None) -> list[str]:
     """
-    0..1: overlap of words in user style prompt with frame_tags, name, id.
-    Neutral 0.5 when prompt empty.
+    Non-empty, de-duplicated tokens (length > 1) from style/keyword prompt strings.
     """
-    if not prompt or not str(prompt).strip():
-        return 0.5
-    tokens = [t.lower() for t in re.split(r"[^\w]+", prompt) if len(t) > 1]
+    seen: set[str] = set()
+    out: list[str] = []
+    for q in queries:
+        if not q or not str(q).strip():
+            continue
+        for t in re.split(r"[^\w]+", str(q).strip()):
+            tl = t.lower()
+            if len(tl) < 2 or tl in seen:
+                continue
+            seen.add(tl)
+            out.append(tl)
+    return out
+
+
+def _product_search_blob(product: dict[str, Any]) -> tuple[str, list[str]]:
+    """Lowercase name, id, and per-tag strings for matching."""
+    tags = [str(x).lower() for x in (product.get("frame_tags") or []) if x is not None]
+    name = str(product.get("name") or "").lower()
+    pid = str(product.get("id") or "").lower()
+    blob = f"{name} {pid} {' '.join(tags)}"
+    return blob, tags
+
+
+def product_matches_any_search_token(product: dict[str, Any], tokens: list[str]) -> bool:
+    if not tokens:
+        return True
+    blob, tags = _product_search_blob(product)
+    name = str(product.get("name") or "").lower()
+    pid = str(product.get("id") or "").lower()
+    for t in tokens:
+        if t in blob or t in name or t in pid or any(t in tag for tag in tags):
+            return True
+    return False
+
+
+def score_text_query_match(
+    product: dict[str, Any],
+    style_prompt: str | None,
+    keyword_query: str | None = None,
+) -> float:
+    """
+    0..1: recall of query tokens (from **style** + **keyword** prompts) against
+    product name, id, and frame_tags. Neutral 0.5 when no tokens.
+    """
+    tokens = parse_search_tokens(style_prompt, keyword_query)
     if not tokens:
         return 0.5
-    blob = " ".join(
-        [
-            str(product.get("name") or ""),
-            str(product.get("id") or ""),
-            *map(str, product.get("frame_tags") or []),
-        ],
-    ).lower()
+    blob, _tags = _product_search_blob(product)
     hits = sum(1 for t in tokens if t in blob)
-    return min(1.0, hits / max(len(tokens), 1))
+    return min(1.0, hits / len(tokens))
+
+
+def score_style_prompt_match(product: dict[str, Any], prompt: str | None) -> float:
+    """Back-compat: same as `score_text_query_match(product, prompt, None)`."""
+    return score_text_query_match(product, prompt, None)
 
 
 def score_region_affinity(
@@ -508,6 +548,7 @@ def personalized_rank(
     weights: RankingWeights | None = None,
     height_over_width: float | None = None,
     style_prompt: str | None = None,
+    keyword_query: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Full blend: face rules + global popularity + demographics + last order + region.
@@ -515,6 +556,7 @@ def personalized_rank(
 
     When `height_over_width` is set (face height / jaw width from landmarks), the face
     sub-score also blends **elongation_fit** (tag alignment for wide vs tall proportion).
+    ``style_prompt`` and ``keyword_query`` are combined for the text/keyword score.
     """
     w = (weights or RankingWeights()).normalized()
     ranked: list[tuple[float, dict[str, Any]]] = []
@@ -530,7 +572,7 @@ def personalized_rank(
         s_demo = score_demographic_match(p, demo)
         s_pur = score_purchase_affinity(p, last_products)
         s_reg = score_region_affinity(p, region, regional)
-        s_prompt = score_style_prompt_match(p, style_prompt)
+        s_text = score_text_query_match(p, style_prompt, keyword_query)
         s_color = score_color_lifecycle_match(p, demo)
         total = (
             w["w_face"] * s_face
@@ -538,7 +580,7 @@ def personalized_rank(
             + w["w_demo"] * s_demo
             + w["w_purchase"] * s_pur
             + w["w_region"] * s_reg
-            + w["w_prompt"] * s_prompt
+            + w["w_prompt"] * s_text
             + w["w_color"] * s_color
         )
         breakdown: dict[str, Any] = {
@@ -549,7 +591,7 @@ def personalized_rank(
             "demographics": round(s_demo, 4),
             "purchase_continuity": round(s_pur, 4),
             "region_cohort": round(s_reg, 4),
-            "style_prompt": round(s_prompt, 4),
+            "text_query_match": round(s_text, 4),
             "color_lifecycle": round(s_color, 4),
             "weights": w,
         }

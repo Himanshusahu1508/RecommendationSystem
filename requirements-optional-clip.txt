@@ -1,0 +1,8 @@
+# CLIP (Hugging Face) + FAISS (large downloads). Optional for RS2.
+#   pip install -r requirements-optional-clip.txt
+torch
+torchvision
+transformers
+numpy
+Pillow
+faiss-cpu
